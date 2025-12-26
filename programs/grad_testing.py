@@ -12,8 +12,20 @@ from itertools import cycle
 import pandas as pd
 
 
-# fix zarr?
-# environ["ZARR_SINGLE_THREADED"] = "1"
+regions = {'Arctic': ((60, 80), (0, 360)),
+           'NA': ((30, 50), (290, 360)),
+           'NP': ((30, 50), (170, 240)),
+           'NWA': ((0, 30), (290, 335)),
+           'NI': ((0, 30), (45, 100)),
+           'NWP': ((0, 30), (120, 170)),
+           'NEP': ((0, 30), (210, 250)),
+           'SEP': ((-30, 0), (110, 290)),
+           'SEA': ((-30, 0), (335, 375)),
+           'SWP': ((-30, 0), (150, 190)),
+           'IndOcn': ((-40, -10), (75, 120)),
+           'SA': ((-50, -30), (305, 375)),
+           'SP': ((-50, -30), (190, 270)),
+           'SI': ((-50, -30), (30, 100))}
 
 
 chdir('C:/Users/aakas/Documents/MCB-Zonal/')
@@ -61,18 +73,41 @@ def load_atmos_data(fpath):
 
 
 def weighted_mean(data, var, weights, min_lat, max_lat, 
-                  min_lon, max_lon, topo):
+                  min_lon, max_lon, topo, ocean=True):
     """
     Returns weighted mean using xarray interface
     """
     # replace all land grid cells with NaN
-    data = data.where(topo.LANDFRAC <= 0.5)
-    weights = weights.sel(lat=slice(min_lat, max_lat),
-                          lon=slice(min_lon, max_lon))
-    data = data.sel(lat=slice(min_lat, max_lat),
-                    lon=slice(min_lon, max_lon))    
-    data_w = data[var].weighted(weights)
-    return data_w.mean()
+    if ocean:
+        data = data.where(topo.LANDFRAC <= 0.5)
+    
+    if max_lon <= 360:
+        # normal process
+        weights = weights.sel(lat=slice(min_lat, max_lat),
+                              lon=slice(min_lon, max_lon))
+        data = data.sel(lat=slice(min_lat, max_lat),
+                        lon=slice(min_lon, max_lon))    
+        data_w = data[var].weighted(weights)
+        weight_mean = data_w.mean()
+    else:
+        # if the box crosses the prime meridian
+        weights_west = weights.sel(lat=slice(min_lat, max_lat),
+                                   lon=slice(min_lon, 360))
+        weights_east = weights.sel(lat=slice(min_lat, max_lat),
+                                   lon=slice(0, max_lon - 360))
+        data_west = data.sel(lat=slice(min_lat, max_lat),
+                             lon=slice(min_lon, 360))
+        data_east = data.sel(lat=slice(min_lat, max_lat),
+                             lon=slice(0, max_lon - 360))
+        data_west_w = data_west[var].weighted(weights_west).mean()
+        data_east_w = data_east[var].weighted(weights_east).mean()
+        # finally weight by areas across the meridian
+        weights_west = weights_west.sum()
+        weights_east = weights_east.sum()
+        weight_mean = (weights_west * data_west_w + weights_east * data_east_w) /\
+            (weights_east + weights_west)
+    
+    return weight_mean
 
 
 def calc_vars(data_dict, topo_data):
@@ -163,7 +198,7 @@ def load_reference(fpath, name='cesm'):
     cases = []
     curr_case = None
     for file in files:
-        data = xr.load_dataset(path.join(fpath, file))
+        data = xr.load_dataset(path.join(fpath, file), engine='netcdf4')
         if data.time.min().dt.year >= 2065:
             # we only want data until 2065
             continue
@@ -236,7 +271,7 @@ def calc_heat_trans(cesm_dict, topo_map):
         value = value.drop_duplicates(dim='time')
         last_twenty = value.time[-240:]
         rel_data = value.sel(time=last_twenty).mean(dim='time')
-        rel_data['toa_energy_bal'] = rel_data['FSNTOA'] + rel_data['FLNT']
+        rel_data['toa_energy_bal'] = rel_data['FSNTOA'] - rel_data['FLNT']
         # mean heat uptake
         energy_imbal = rel_data['toa_energy_bal'].\
             weighted(topo_map.AREA).mean()
@@ -273,13 +308,14 @@ def calc_ocean_heat_trans(cesm_dict, topo_map):
         rel_data = value.sel(time=last_twenty).mean(dim='time')
         # surface energy budget- I think the sign convention is correct
         rel_data['sfc_energy_bal'] = rel_data['FSNS'] - rel_data['LHFLX'] -\
-            rel_data['SHFLX'] + rel_data['FLNS']
+            rel_data['SHFLX'] - rel_data['FLNS']
+        # mask land area now
+        # rel_data = rel_data.where(topo_map.LANDFRAC < 0.5)
+        # Subtract energy imbalance
         energy_imbal = rel_data['sfc_energy_bal'].\
             weighted(topo_map.AREA).mean()
         # subtract mean heat uptake from field
         rel_data['sfc_energy_bal'] -= float(energy_imbal)
-        # mask land area now
-        rel_data = rel_data.where(topo_map.LANDFRAC < 0.5)
         # start integration- thanks chatGPT for code corrections
         # --- 1. Zonal integration (gives W per latitude band)
         band_flux = rel_data['sfc_energy_bal'].\
@@ -296,10 +332,117 @@ def calc_ocean_heat_trans(cesm_dict, topo_map):
         poleward_data[key] = Hphi.data
     poleward_data['lat'] = topo_map.lat
     return pd.DataFrame(poleward_data)
+ 
+
+def toa_rad_anoms(cesm_dict, cesm_topo, regions):
+    """
+    Returns radiative anomalies across different simulations
+    calculating the average over the last twenty years of simulation
+    and subtracting the reference simulations
     
+    dict format: global rad anomaly, global LW anomaly,
+    global SW anomaly, and the same for within the patch regions
+    """
+    anomalies = pd.DataFrame(columns=['RadNet_global', 'RadNet_box',
+                                      'T_global', 'T_box', 'Area'])
+    # calculate means and add radiation field
+    for key, value in cesm_dict.items():
+        value = value.drop_duplicates(dim='time')
+        last_twenty = value.time[-240:]
+        rel_data = value.sel(time=last_twenty).mean(dim='time')
+        rel_data['RadNet'] = rel_data['FSNTOA'] - rel_data['FLNT']
+        # isolate regional averages
+        coords = regions[key]
+        global_tanom = weighted_mean(rel_data.copy(), 'TS', cesm_topo.AREA,
+                                     min_lat=-90, max_lat=90,
+                                     min_lon=0, max_lon=360,
+                                     topo=cesm_topo, ocean=False)
+        global_radanom = weighted_mean(rel_data.copy(), 'RadNet', cesm_topo.AREA,
+                                     min_lat=-90, max_lat=90,
+                                     min_lon=0, max_lon=360,
+                                     topo=cesm_topo, ocean=False)
+        region_tanom = weighted_mean(rel_data.copy(), 'TS', cesm_topo.AREA,
+                                     min_lat=coords[0][0], max_lat=coords[0][1],
+                                     min_lon=coords[1][0], max_lon=coords[1][1],
+                                     topo=cesm_topo, ocean=False)
+        region_radanom = weighted_mean(rel_data.copy(), 'RadNet', cesm_topo.AREA,
+                                     min_lat=coords[0][0], max_lat=coords[0][1],
+                                     min_lon=coords[1][0], max_lon=coords[1][1],
+                                     topo=cesm_topo, ocean=False)
+        area = weighted_mean(cesm_topo.copy(), 'AREA', cesm_topo.AREA,
+                            min_lat=coords[0][0], max_lat=coords[0][1],
+                            min_lon=coords[1][0], max_lon=coords[1][1],
+                            topo=cesm_topo, ocean=False)
+        data = {'RadNet_global': float(global_radanom),
+                'RadNet_box': float(region_radanom),
+                'T_global': float(global_tanom),
+                'T_box': float(region_tanom),
+                'Area': float(area)}
+        anomalies.loc[key] = data
+    
+    return anomalies
+
+
+def ref_rad_anoms(cesm_ref, cesm_topo, regions):
+    """
+    Calculates the radiative anomalies and temperature anomalies within
+    each box similar to the toa_rad_anoms() function
+    
+    Difference- averaging across all three ensemble members
+    """
+    anomalies = pd.DataFrame(columns=['RadNet_global', 'RadNet_box',
+                                      'T_global', 'T_box', 'Area'])
+    # calculate means of radiation field
+    for region, coords in regions.items():
+        global_tanom = []
+        global_radanom = []
+        region_tanom = []
+        region_radanom = []
+        area = []
+        for key, value in cesm_ref.items():
+            value = value.drop_duplicates(dim='time')
+            last_twenty = value.time[-240:]
+            rel_data = value.sel(time=last_twenty).mean(dim='time')
+            rel_data['RadNet'] = rel_data['FSNTOA'] - rel_data['FLNT']
+            # isolate regional averages
+            global_tanom.append(weighted_mean(rel_data.copy(), 'TS', cesm_topo.AREA,
+                                min_lat=-90, max_lat=90,
+                                min_lon=0, max_lon=360,
+                                topo=cesm_topo, ocean=False))
+            global_radanom.append(weighted_mean(rel_data.copy(), 'RadNet', cesm_topo.AREA,
+                                min_lat=-90, max_lat=90,
+                                min_lon=0, max_lon=360,
+                                topo=cesm_topo, ocean=False))
+            region_tanom.append(weighted_mean(rel_data.copy(), 'TS', cesm_topo.AREA,
+                                min_lat=coords[0][0], max_lat=coords[0][1],
+                                min_lon=coords[1][0], max_lon=coords[1][1],
+                                topo=cesm_topo, ocean=False))
+            region_radanom.append(weighted_mean(rel_data.copy(), 'RadNet', cesm_topo.AREA,
+                                min_lat=coords[0][0], max_lat=coords[0][1],
+                                min_lon=coords[1][0], max_lon=coords[1][1],
+                                topo=cesm_topo, ocean=False))
+            area.append(weighted_mean(cesm_topo.copy(), 'AREA', cesm_topo.AREA,
+                        min_lat=coords[0][0], max_lat=coords[0][1],
+                        min_lon=coords[1][0], max_lon=coords[1][1],
+                        topo=cesm_topo, ocean=False))
+        global_tanom = np.mean(global_tanom)
+        global_radanom = np.mean(global_radanom)
+        region_tanom = np.mean(region_tanom)
+        region_radanom = np.mean(region_radanom)
+        area = np.mean(area)
+        data = {'RadNet_global': float(global_radanom),
+                'RadNet_box': float(region_radanom),
+                'T_global': float(global_tanom),
+                'T_box': float(region_tanom),
+                'Area': float(area)}
+        anomalies.loc[region] = data
+        
+    return anomalies        
+   
 
 def main():
-    global cesm_info, grad_info, cesm_pole, data_dict
+    global pole_anoms
+    global anomalies, reference
     data_dict = load_atmos_data('mcb_runs/CESM')
     # load simulation data
     cesm_dict = load_reference('reference_runs/CESM', 'cesm')
@@ -332,8 +475,20 @@ def main():
     cesm_pole_ref['mean'] = cesm_pole_ref[['cesm_1', 'cesm_2', 'cesm_3']].\
         mean(axis=1)
         
-    cesm_ocean = calc_ocean_heat_trans(data_dict, cesm_grid)
+    cesm_ocean = calc_ocean_heat_trans(data_dict, cesm_grid)     
+    cesm_ocean_ref = calc_ocean_heat_trans(cesm_dict, cesm_grid)                          
+    cesm_ocean_ref['mean'] = cesm_ocean_ref[['cesm_1', 'cesm_2', 'cesm_3']].\
+        mean(axis=1)
+    # atmosphere now
+    cesm_atms = cesm_pole - cesm_ocean 
+    #cesm_atms['lat'] = cesm_pole['lat']
+    cesm_atms_ref = cesm_pole_ref - cesm_ocean_ref
+    #cesm_atms_ref['lat'] = cesm_pole_ref['lat']
     
+    anomalies = toa_rad_anoms(data_dict, cesm_grid, regions)
+    reference = ref_rad_anoms(cesm_dict, cesm_grid, regions)
+           
+    true_anoms = anomalies - reference
     
 if __name__ == '__main__':
     main()
